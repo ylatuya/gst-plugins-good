@@ -9,6 +9,7 @@ libgstisomp4_la_LIBADD = \
     -lgstrtp-@GST_MAJORMINOR@ \
     -lgsttag-@GST_MAJORMINOR@ \
     -lgstpbutils-@GST_MAJORMINOR@ \
+    -lgstvideo-@GST_MAJORMINOR@ \
     $(GST_BASE_LIBS) $(GST_LIBS) $(ZLIB_LIBS)
 libgstisomp4_la_LDFLAGS = ${GST_PLUGIN_LDFLAGS}
 libgstisomp4_la_SOURCES = isomp4-plugin.c gstrtpxqtdepay.c \

@@ -126,6 +126,8 @@ struct _GstQTPad
   gint64 fragment_duration;
   /* optional fragment index book-keeping */
   AtomTFRA *tfra;
+  /* GstForceKeyUnit event requesting a new fragmet for this fragment */
+  GstEvent *forcekeyunit_event;
 
   /* if nothing is set, it won't be called */
   GstQTPadPrepareBufferFunc prepare_buf_func;
@@ -190,6 +192,7 @@ struct _GstQTMux
   gchar *moov_recov_file_path;
   guint32 fragment_duration;
   gboolean streamable;
+  gint fragment_method;
 
   /* for collect pads event handling function */
   GstPadEventFunction collect_event;

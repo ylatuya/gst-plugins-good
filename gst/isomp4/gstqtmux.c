@@ -117,6 +117,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstcollectpads.h>
+#include <gst/video/video.h>
 #include <gst/tag/xmpwriter.h>
 
 #include <sys/types.h>
@@ -171,6 +172,37 @@ gst_qt_mux_dts_method_get_type (void)
 #define GST_TYPE_QT_MUX_DTS_METHOD \
   (gst_qt_mux_dts_method_get_type ())
 
+enum
+{
+  FRAGMENT_METHOD_NONE,
+  FRAGMENT_METHOD_TIME,
+  FRAGMENT_METHOD_EVENT
+};
+
+static GType
+gst_qt_mux_fragment_method_get_type (void)
+{
+  static GType gst_qt_mux_fragment_method = 0;
+
+  if (!gst_qt_mux_fragment_method) {
+    static const GEnumValue fragment_methods[] = {
+      {FRAGMENT_METHOD_NONE, "Do not fragment", "none"},
+      {FRAGMENT_METHOD_TIME, "Time", "time"},
+      {FRAGMENT_METHOD_EVENT, "GstForceKeyUnit events", "event"},
+      {0, NULL, NULL},
+    };
+
+    gst_qt_mux_fragment_method =
+        g_enum_register_static ("GstQTMuxFragmentMethods", fragment_methods);
+  }
+
+  return gst_qt_mux_fragment_method;
+}
+
+#define GST_TYPE_QT_MUX_FRAGMENT_METHOD \
+  (gst_qt_mux_fragment_method_get_type ())
+
+
 /* QTMux signals and args */
 enum
 {
@@ -190,6 +222,7 @@ enum
   PROP_STREAMABLE,
   PROP_DTS_METHOD,
   PROP_DO_CTTS,
+  PROP_FRAGMENT_METHOD,
 };
 
 /* some spare for header size as well */
@@ -202,9 +235,10 @@ enum
 #define DEFAULT_FAST_START              FALSE
 #define DEFAULT_FAST_START_TEMP_FILE    NULL
 #define DEFAULT_MOOV_RECOV_FILE         NULL
-#define DEFAULT_FRAGMENT_DURATION       0
+#define DEFAULT_FRAGMENT_DURATION       2 * GST_SECOND
 #define DEFAULT_STREAMABLE              FALSE
 #define DEFAULT_DTS_METHOD              DTS_METHOD_REORDER
+#define DEFAULT_FRAGMENT_METHOD         FRAGMENT_METHOD_NONE
 
 
 static void gst_qt_mux_finalize (GObject * object);
@@ -337,15 +371,22 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_FRAGMENT_DURATION,
       g_param_spec_uint ("fragment-duration", "Fragment duration",
-          "Fragment durations in ms (produce a fragmented file if > 0)",
-          0, G_MAXUINT32, klass->format == GST_QT_MUX_FORMAT_ISML ?
-          2000 : DEFAULT_FRAGMENT_DURATION,
+          "Fragment durations in ms (used when the fragment-method='time')",
+          0, G_MAXUINT32, 2000,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_STREAMABLE,
       g_param_spec_boolean ("streamable", "Streamable",
           "If set to true, the output should be as if it is to be streamed "
           "and hence no indexes written or duration written.",
           DEFAULT_STREAMABLE,
+          G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_FRAGMENT_METHOD,
+      g_param_spec_enum ("fragment-method", "fragment-method",
+          "Method used to delimit fragments boundaries",
+          GST_TYPE_QT_MUX_FRAGMENT_METHOD,
+          klass->format ==
+          GST_QT_MUX_FORMAT_ISML ? FRAGMENT_METHOD_TIME :
+          DEFAULT_FRAGMENT_METHOD,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->request_new_pad =
@@ -1689,9 +1730,15 @@ gst_qt_mux_start_file (GstQTMux * qtmux)
     /* well, it's moov pos if fragmented ... */
     qtmux->mdat_pos = qtmux->header_size;
 
-    if (qtmux->fragment_duration) {
-      GST_DEBUG_OBJECT (qtmux, "fragment duration %d ms, writing headers",
-          qtmux->fragment_duration);
+    if (qtmux->fragment_method != FRAGMENT_METHOD_NONE) {
+      if (qtmux->fragment_method == FRAGMENT_METHOD_TIME) {
+        GST_DEBUG_OBJECT (qtmux, "fragment duration %d ms, writing headers",
+            qtmux->fragment_duration);
+      } else if (qtmux->fragment_method == FRAGMENT_METHOD_EVENT) {
+        GST_DEBUG_OBJECT (qtmux,
+            "fragment with GstForceKeyUnit events, writing headers",
+            qtmux->fragment_duration);
+      }
       /* also used as snapshot marker to indicate fragmented file */
       qtmux->fragment_sequence = 1;
       /* prepare moov and/or tags */
@@ -1955,6 +2002,7 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
     guint32 delta, guint32 size, gboolean sync, gint64 pts_offset)
 {
   GstFlowReturn ret = GST_FLOW_OK;
+  gboolean pad_sync, event_sync, time_sync;
 
   /* setup if needed */
   if (G_UNLIKELY (!pad->traf || force))
@@ -1963,13 +2011,22 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
 flush:
   /* flush pad fragment if threshold reached,
    * or at new keyframe if we should be minding those in the first place */
-  if (G_UNLIKELY (force || (sync && pad->sync) ||
-          pad->fragment_duration < (gint64) delta)) {
+  pad_sync = qtmux->fragment_method != FRAGMENT_METHOD_EVENT && (sync
+      && pad->sync);
+  event_sync = pad->forcekeyunit_event != NULL &&
+      !GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  time_sync = pad->fragment_duration < (guint64) delta;
+
+  if (G_UNLIKELY (force || pad_sync || time_sync || event_sync)) {
     AtomMOOF *moof;
     guint64 size = 0, offset = 0;
     guint8 *data = NULL;
     GstBuffer *buffer;
     guint i, total_size;
+
+    if (GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT)) {
+      GST_WARNING ("Next fragment will not start with a keyframe");
+    }
 
     /* now we know where moof ends up, update offset in tfra */
     if (pad->tfra)
@@ -2005,6 +2062,12 @@ flush:
         gst_buffer_unref (atom_array_index (&pad->fragment_buffers, i));
     }
 
+    GST_LOG_OBJECT (qtmux, "resending GstForceKeyUnit event downstream");
+    if (pad->forcekeyunit_event != NULL) {
+      gst_pad_push_event (qtmux->srcpad, pad->forcekeyunit_event);
+      pad->forcekeyunit_event = NULL;
+    }
+
     atom_array_clear (&pad->fragment_buffers);
     atom_moof_free (moof);
     qtmux->fragment_sequence++;
@@ -2016,8 +2079,13 @@ init:
     GST_LOG_OBJECT (qtmux, "setting up new fragment");
     pad->traf = atom_traf_new (qtmux->context, atom_trak_get_id (pad->trak));
     atom_array_init (&pad->fragment_buffers, 512);
-    pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
-        atom_trak_get_timescale (pad->trak), 1000);
+    if (qtmux->fragment_method == FRAGMENT_METHOD_TIME)
+      pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
+          atom_trak_get_timescale (pad->trak), 1000);
+    else {
+      /* use a the highest value here so that this condition is never met */
+      pad->fragment_duration = G_MAXUINT32;
+    }
 
     if (G_UNLIKELY (qtmux->mfra && !pad->tfra)) {
       pad->tfra = atom_tfra_new (qtmux->context, atom_trak_get_id (pad->trak));
@@ -3292,11 +3360,25 @@ gst_qt_mux_sink_event (GstPad * pad, GstEvent * event)
 
       break;
     }
+    case GST_EVENT_CUSTOM_DOWNSTREAM:{
+      if (qtmux->fragment_method == FRAGMENT_METHOD_EVENT) {
+        if (gst_video_event_is_force_key_unit (event)) {
+          GstQTPad *qtpad = gst_pad_get_element_private (pad);
+          g_assert (qtpad);
+
+          qtpad->forcekeyunit_event = event;
+          event = NULL;
+          ret = TRUE;
+        }
+      }
+      break;
+    }
     default:
       break;
   }
 
-  ret = qtmux->collect_event (pad, event);
+  if (event != NULL)
+    ret = qtmux->collect_event (pad, event);
   gst_object_unref (qtmux);
 
   return ret;
@@ -3439,6 +3521,9 @@ gst_qt_mux_get_property (GObject * object,
     case PROP_STREAMABLE:
       g_value_set_boolean (value, qtmux->streamable);
       break;
+    case PROP_FRAGMENT_METHOD:
+      g_value_set_enum (value, qtmux->fragment_method);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -3499,6 +3584,9 @@ gst_qt_mux_set_property (GObject * object,
       break;
     case PROP_STREAMABLE:
       qtmux->streamable = g_value_get_boolean (value);
+      break;
+    case PROP_FRAGMENT_METHOD:
+      qtmux->fragment_method = g_value_get_enum (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
