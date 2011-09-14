@@ -106,6 +106,7 @@
 #include <gst/audio/audio.h>
 #include <gst/video/video.h>
 #include <gst/tag/tag.h>
+#include <gst/video/video.h>
 
 #include <sys/types.h>
 #ifdef G_OS_WIN32
@@ -161,6 +162,37 @@ gst_qt_mux_dts_method_get_type (void)
   (gst_qt_mux_dts_method_get_type ())
 #endif
 
+enum
+{
+  FRAGMENT_METHOD_NONE,
+  FRAGMENT_METHOD_TIME,
+  FRAGMENT_METHOD_EVENT
+};
+
+static GType
+gst_qt_mux_fragment_method_get_type (void)
+{
+  static GType gst_qt_mux_fragment_method = 0;
+
+  if (!gst_qt_mux_fragment_method) {
+    static const GEnumValue fragment_methods[] = {
+      {FRAGMENT_METHOD_NONE, "Do not fragment", "none"},
+      {FRAGMENT_METHOD_TIME, "Time", "time"},
+      {FRAGMENT_METHOD_EVENT, "GstForceKeyUnit events", "event"},
+      {0, NULL, NULL},
+    };
+
+    gst_qt_mux_fragment_method =
+        g_enum_register_static ("GstQTMuxFragmentMethods", fragment_methods);
+  }
+
+  return gst_qt_mux_fragment_method;
+}
+
+#define GST_TYPE_QT_MUX_FRAGMENT_METHOD \
+  (gst_qt_mux_fragment_method_get_type ())
+
+
 /* QTMux signals and args */
 enum
 {
@@ -182,6 +214,7 @@ enum
   PROP_DTS_METHOD,
 #endif
   PROP_DO_CTTS,
+  PROP_FRAGMENT_METHOD,
 };
 
 /* some spare for header size as well */
@@ -193,8 +226,9 @@ enum
 #define DEFAULT_FAST_START              FALSE
 #define DEFAULT_FAST_START_TEMP_FILE    NULL
 #define DEFAULT_MOOV_RECOV_FILE         NULL
-#define DEFAULT_FRAGMENT_DURATION       0
+#define DEFAULT_FRAGMENT_DURATION       2 * GST_SECOND
 #define DEFAULT_STREAMABLE              TRUE
+#define DEFAULT_FRAGMENT_METHOD         FRAGMENT_METHOD_NONE
 #ifndef GST_REMOVE_DEPRECATED
 #define DEFAULT_DTS_METHOD              DTS_METHOD_REORDER
 #endif
@@ -222,11 +256,15 @@ static void gst_qt_mux_release_pad (GstElement * element, GstPad * pad);
 /* event */
 static gboolean gst_qt_mux_sink_event (GstCollectPads * pads,
     GstCollectData * data, GstEvent * event, gpointer user_data);
+static gboolean gst_qt_mux_src_event (GstPad * pad, GstObject * parent,
+    GstEvent * event);
 
 static GstFlowReturn gst_qt_mux_handle_buffer (GstCollectPads * pads,
     GstCollectData * cdata, GstBuffer * buf, gpointer user_data);
 static GstFlowReturn gst_qt_mux_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
     GstBuffer * buf);
+static void gst_qt_mux_dequeue_force_key_unit_event (GstQTMux * mux,
+    GstQTPad * pad);
 
 static GstElementClass *parent_class = NULL;
 
@@ -353,14 +391,21 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_FRAGMENT_DURATION,
       g_param_spec_uint ("fragment-duration", "Fragment duration",
-          "Fragment durations in ms (produce a fragmented file if > 0)",
-          0, G_MAXUINT32, GST_QT_MUX_IS_FRAGMENTED (klass) ?
-          2000 : DEFAULT_FRAGMENT_DURATION,
+          "Fragment durations in ms (used when the fragment-method='time')",
+          0, G_MAXUINT32, DEFAULT_FRAGMENT_DURATION,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_STREAMABLE,
       g_param_spec_boolean ("streamable", "Streamable", streamable_desc,
           streamable,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+
+  if (GST_QT_MUX_IS_FRAGMENTED (klass)) {
+    g_object_class_install_property (gobject_class, PROP_FRAGMENT_METHOD,
+        g_param_spec_enum ("fragment-method", "fragment-method",
+            "Method used to delimit fragments boundaries",
+            GST_TYPE_QT_MUX_FRAGMENT_METHOD, DEFAULT_FRAGMENT_METHOD,
+            G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+  }
 
   gstelement_class->request_new_pad =
       GST_DEBUG_FUNCPTR (gst_qt_mux_request_new_pad);
@@ -399,6 +444,12 @@ gst_qt_mux_pad_reset (GstQTPad * qtpad)
     qtpad->traf = NULL;
   }
   atom_array_clear (&qtpad->fragment_buffers);
+
+  g_list_free_full (qtpad->forcekeyunit_events,
+      (GDestroyNotify) gst_event_unref);
+  qtpad->forcekeyunit_events = NULL;
+  qtpad->next_fragment_ts = 0;
+  qtpad->first_fragment = TRUE;
 
   /* reference owned elsewhere */
   qtpad->tfra = NULL;
@@ -484,6 +535,8 @@ gst_qt_mux_init (GstQTMux * qtmux, GstQTMuxClass * qtmux_klass)
 
   templ = gst_element_class_get_pad_template (klass, "src");
   qtmux->srcpad = gst_pad_new_from_template (templ, "src");
+  gst_pad_set_event_function (qtmux->srcpad,
+      (GstPadEventFunction) gst_qt_mux_src_event);
   gst_pad_use_fixed_caps (qtmux->srcpad);
   gst_element_add_pad (GST_ELEMENT (qtmux), qtmux->srcpad);
 
@@ -497,6 +550,11 @@ gst_qt_mux_init (GstQTMux * qtmux, GstQTMuxClass * qtmux_klass)
       GST_DEBUG_FUNCPTR (gst_collect_pads_clip_running_time), qtmux);
 
   /* properties set to default upon construction */
+  if (qtmux_klass->format == GST_QT_MUX_FORMAT_ISML) {
+    qtmux->fragment_method = DEFAULT_FRAGMENT_METHOD;
+  } else {
+    qtmux->fragment_method = FRAGMENT_METHOD_NONE;
+  }
 
   /* always need this */
   qtmux->context =
@@ -1836,9 +1894,14 @@ gst_qt_mux_start_file (GstQTMux * qtmux)
     /* well, it's moov pos if fragmented ... */
     qtmux->mdat_pos = qtmux->header_size;
 
-    if (qtmux->fragment_duration) {
-      GST_DEBUG_OBJECT (qtmux, "fragment duration %d ms, writing headers",
-          qtmux->fragment_duration);
+    if (qtmux->fragment_method != FRAGMENT_METHOD_NONE) {
+      if (qtmux->fragment_method == FRAGMENT_METHOD_TIME) {
+        GST_DEBUG_OBJECT (qtmux, "fragment duration %d ms, writing headers",
+            qtmux->fragment_duration);
+      } else if (qtmux->fragment_method == FRAGMENT_METHOD_EVENT) {
+        GST_DEBUG_OBJECT (qtmux,
+            "fragment with GstForceKeyUnit events, writing headers");
+      }
       /* also used as snapshot marker to indicate fragmented file */
       qtmux->fragment_sequence = 1;
       /* prepare moov and/or tags */
@@ -2127,6 +2190,7 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
     guint32 delta, guint32 size, gboolean sync, gint64 pts_offset)
 {
   GstFlowReturn ret = GST_FLOW_OK;
+  gboolean pad_sync, event_sync, time_sync;
   GstQTMuxClass *qtmux_klass = (GstQTMuxClass *) (G_OBJECT_GET_CLASS (qtmux));
 
   /* setup if needed */
@@ -2136,8 +2200,19 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
 flush:
   /* flush pad fragment if threshold reached,
    * or at new keyframe if we should be minding those in the first place */
-  if (G_UNLIKELY (force || (sync && pad->sync) ||
-          pad->fragment_duration < (gint64) delta)) {
+  pad_sync = qtmux->fragment_method != FRAGMENT_METHOD_EVENT && (sync
+      && pad->sync);
+  event_sync = pad->forcekeyunit_events != NULL &&
+      GST_BUFFER_PTS (buf) >= pad->next_fragment_ts;
+  time_sync = pad->fragment_duration < (guint64) delta;
+
+  if (event_sync && pad->first_fragment) {
+    pad->first_fragment = FALSE;
+    gst_qt_mux_dequeue_force_key_unit_event (qtmux, pad);
+    goto init;
+  }
+
+  if (G_UNLIKELY (force || pad_sync || time_sync || event_sync)) {
     AtomMOOF *moof;
     guint64 size = 0, offset = 0;
     guint8 *data = NULL;
@@ -2190,6 +2265,8 @@ flush:
         gst_buffer_unref (atom_array_index (&pad->fragment_buffers, i));
     }
 
+    gst_qt_mux_dequeue_force_key_unit_event (qtmux, pad);
+
     atom_array_clear (&pad->fragment_buffers);
     atom_moof_free (moof);
     qtmux->fragment_sequence++;
@@ -2201,8 +2278,13 @@ init:
     GST_LOG_OBJECT (qtmux, "setting up new fragment");
     pad->traf = atom_traf_new (qtmux->context, atom_trak_get_id (pad->trak));
     atom_array_init (&pad->fragment_buffers, 512);
-    pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
-        atom_trak_get_timescale (pad->trak), 1000);
+    if (qtmux->fragment_method == FRAGMENT_METHOD_TIME)
+      pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
+          atom_trak_get_timescale (pad->trak), 1000);
+    else {
+      /* use a the highest value here so that this condition is never met */
+      pad->fragment_duration = G_MAXUINT32;
+    }
 
     if (G_UNLIKELY (qtmux->mfra && !pad->tfra)) {
       pad->tfra = atom_tfra_new (qtmux->context, atom_trak_get_id (pad->trak));
@@ -3302,6 +3384,154 @@ refuse_renegotiation:
   }
 }
 
+static gint
+_sort_fku_events (GstEvent * e1, GstEvent * e2)
+{
+  GstClockTime ts1, ts2;
+
+  gst_structure_get_clock_time (gst_event_get_structure (e1),
+      "running-time", &ts1);
+  gst_structure_get_clock_time (gst_event_get_structure (e2),
+      "running-time", &ts2);
+
+  return (gint) (ts1 - ts2);
+}
+
+static gint
+_compare_fku_events (GstEvent * ev1, GstEvent * ev2)
+{
+  guint event_count_1, event_count_2;
+
+  gst_structure_get_uint (gst_event_get_structure (ev1),
+      "count", &event_count_1);
+  gst_structure_get_uint (gst_event_get_structure (ev2),
+      "count", &event_count_2);
+
+  return event_count_2 - event_count_1;
+}
+
+static void
+gst_qt_mux_enqueue_force_key_unit_event (GstQTMux * qtmux, GstEvent * event,
+    GstQTPad * pad)
+{
+  GSList *walk;
+
+  GST_DEBUG_OBJECT (qtmux, "Queueing ForceKeyUnit event %p", event);
+
+  GST_OBJECT_LOCK (qtmux);
+  for (walk = qtmux->sinkpads; walk; walk = g_slist_next (walk)) {
+    GstClockTime event_ts;
+    const GstStructure *s;
+    GstQTPad *qtpad = (GstQTPad *) walk->data;
+
+    /* Downstream events applies to a single pad */
+    if (pad != NULL && qtpad != pad)
+      continue;
+
+    if (g_list_find_custom (qtpad->forcekeyunit_events, event,
+            (GCompareFunc) _compare_fku_events) != NULL) {
+      GST_DEBUG_OBJECT (qtmux, "Dropping duplicated ForceKeyUnit event %p",
+          event);
+      continue;
+    }
+
+    gst_structure_get_clock_time (gst_event_get_structure (event),
+        "running-time", &event_ts);
+    if (qtpad->last_dts > event_ts) {
+      GST_DEBUG_OBJECT (qtmux, "Dropping late ForceKeyUnit event %p", event);
+      continue;
+    }
+    qtpad->forcekeyunit_events =
+        g_list_insert_sorted (qtpad->forcekeyunit_events, gst_event_ref (event),
+        (GCompareFunc) _sort_fku_events);
+
+    s = gst_event_get_structure ((GstEvent *)
+        g_list_first (qtpad->forcekeyunit_events)->data);
+    gst_structure_get_clock_time (s, "running-time", &qtpad->next_fragment_ts);
+    GST_DEBUG_OBJECT (qtmux, "Next fragment will start at %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (qtpad->next_fragment_ts));
+  }
+  gst_event_unref (event);
+  GST_OBJECT_UNLOCK (qtmux);
+}
+
+static void
+gst_qt_mux_dequeue_force_key_unit_event (GstQTMux * qtmux, GstQTPad * pad)
+{
+  GSList *walk;
+  GstEvent *event;
+
+  if (pad->forcekeyunit_events == NULL) {
+    GST_WARNING_OBJECT (qtmux, "No events queued");
+    return;
+  }
+
+  GST_LOG_OBJECT (qtmux, "resending GstForceKeyUnit event downstream");
+  event = (GstEvent *) g_list_first (pad->forcekeyunit_events)->data;
+  gst_event_ref (event);
+
+  /* Remove the event from all the sink pads now that we have created the
+   * fragment */
+  for (walk = qtmux->sinkpads; walk; walk = g_slist_next (walk)) {
+    GstEvent *dup_ev;
+    GstQTPad *qtpad = (GstQTPad *) walk->data;
+
+    dup_ev = (GstEvent *) g_list_find_custom (qtpad->forcekeyunit_events, event,
+        (GCompareFunc) _compare_fku_events)->data;
+
+    if (dup_ev != NULL) {
+      qtpad->forcekeyunit_events = g_list_remove (qtpad->forcekeyunit_events,
+          dup_ev);
+      gst_event_unref (dup_ev);
+    }
+  }
+
+  event->type = GST_EVENT_CUSTOM_DOWNSTREAM;
+  gst_pad_push_event (qtmux->srcpad, event);
+  if (pad->forcekeyunit_events == NULL) {
+    pad->next_fragment_ts = GST_CLOCK_TIME_NONE;
+  } else {
+    event = (GstEvent *) g_list_first (pad->forcekeyunit_events)->data;
+    gst_structure_get_clock_time (gst_event_get_structure (event),
+        "running-time", &pad->next_fragment_ts);
+  }
+}
+
+static gboolean
+gst_qt_mux_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
+{
+  GstQTMux *qtmux;
+  gboolean ret = TRUE;
+
+  qtmux = GST_QT_MUX_CAST (parent);
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CUSTOM_UPSTREAM:{
+      if (qtmux->fragment_method == FRAGMENT_METHOD_EVENT) {
+        if (gst_video_event_is_force_key_unit (event)) {
+          gst_qt_mux_enqueue_force_key_unit_event (qtmux,
+              gst_event_ref (event), NULL);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (event != NULL) {
+    GSList *walk;
+
+    for (walk = qtmux->sinkpads; walk; walk = g_slist_next (walk)) {
+      GstQTPad *qtpad = (GstQTPad *) walk->data;
+      gst_event_ref (event);
+      ret &= gst_pad_push_event (qtpad->collect.pad, event);
+    }
+    gst_event_unref (event);
+  }
+
+  return ret;
+}
+
 static gboolean
 gst_qt_mux_subtitle_sink_set_caps (GstQTPad * qtpad, GstCaps * caps)
 {
@@ -3452,6 +3682,17 @@ gst_qt_mux_sink_event (GstCollectPads * pads, GstCollectData * data,
       gst_event_unref (event);
       event = NULL;
       ret = TRUE;
+      break;
+    }
+    case GST_EVENT_CUSTOM_DOWNSTREAM:{
+      if (qtmux->fragment_method == FRAGMENT_METHOD_EVENT) {
+        if (gst_video_event_is_force_key_unit (event)) {
+          GstQTPad *qtpad = gst_pad_get_element_private (pad);
+          gst_qt_mux_enqueue_force_key_unit_event (qtmux, event, qtpad);
+          event = NULL;
+          ret = TRUE;
+        }
+      }
       break;
     }
     default:
@@ -3612,6 +3853,14 @@ gst_qt_mux_get_property (GObject * object,
       }
       break;
     }
+    case PROP_FRAGMENT_METHOD:{
+      if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
+        g_value_set_enum (value, qtmux->fragment_method);
+      } else {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      }
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -3676,6 +3925,14 @@ gst_qt_mux_set_property (GObject * object,
     case PROP_STREAMABLE:{
       if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
         qtmux->streamable = g_value_get_boolean (value);
+      } else {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      }
+      break;
+    }
+    case PROP_FRAGMENT_METHOD:{
+      if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
+        qtmux->fragment_method = g_value_get_enum (value);
       } else {
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       }
