@@ -312,6 +312,11 @@ G_BEGIN_DECLS
 #define MS_WAVE_FOURCC(codecid)  GST_MAKE_FOURCC( \
         'm', 's', ((codecid)>>8)&0xff, ((codecid)&0xff))
 
+/* DASH */
+#define FOURCC_styp     GST_MAKE_FOURCC('s','t','y','p')
+#define FOURCC_dash     GST_MAKE_FOURCC('d','a','s','h')
+#define FOURCC_msdh     GST_MAKE_FOURCC('m','s','d','h')
+
 G_END_DECLS
 
 #endif /* __FOURCC_H__ */

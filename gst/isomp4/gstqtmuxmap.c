@@ -200,6 +200,18 @@ GstQTMuxFormatProp gst_qt_mux_format_list[] = {
         GST_STATIC_CAPS (MP3_CAPS "; " AAC_CAPS),
       GST_STATIC_CAPS_NONE}
   ,
+  /* DASH (ISO 14496-12/AMD 3) */
+  {
+        GST_QT_MUX_FORMAT_DASH,
+        GST_RANK_PRIMARY,
+        "mp4dashmux",
+        "DASH",
+        "GstDASHMux",
+        GST_STATIC_CAPS ("video/quicktime, variant = (string) dash-fragmented"),
+        GST_STATIC_CAPS (H264_CAPS),
+        GST_STATIC_CAPS (MP3_CAPS "; " AAC_CAPS)
+      }
+  ,
   /* 3GPP Technical Specification 26.244 V7.3.0
    * (extended in 3GPP2 File Formats for Multimedia Services) */
   {
@@ -287,6 +299,7 @@ gst_qt_mux_map_format_to_header (GstQTMuxFormat format, GstBuffer ** _prefix,
   static guint32 qt_brands[] = { 0 };
   static guint32 mp4_brands[] = { FOURCC_mp41, FOURCC_isom, FOURCC_iso2, 0 };
   static guint32 isml_brands[] = { FOURCC_iso2, 0 };
+  static guint32 dash_brands[] = { FOURCC_iso2, FOURCC_dash, 0 };
   static guint32 gpp_brands[] = { FOURCC_isom, FOURCC_iso2, 0 };
   static guint32 mjp2_brands[] = { FOURCC_isom, FOURCC_iso2, 0 };
   static guint8 mjp2_prefix[] =
@@ -314,6 +327,10 @@ gst_qt_mux_map_format_to_header (GstQTMuxFormat format, GstBuffer ** _prefix,
     case GST_QT_MUX_FORMAT_ISML:
       major = FOURCC_isml;
       comp = isml_brands;
+      break;
+    case GST_QT_MUX_FORMAT_DASH:
+      major = FOURCC_isom;
+      comp = dash_brands;
       break;
     case GST_QT_MUX_FORMAT_3GP:
     {
