@@ -384,9 +384,9 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
       g_param_spec_enum ("fragment-method", "fragment-method",
           "Method used to delimit fragments boundaries",
           GST_TYPE_QT_MUX_FRAGMENT_METHOD,
-          klass->format ==
-          GST_QT_MUX_FORMAT_ISML ? FRAGMENT_METHOD_TIME :
-          DEFAULT_FRAGMENT_METHOD,
+          (klass->format == GST_QT_MUX_FORMAT_ISML ||
+              klass->format == GST_QT_MUX_FORMAT_DASH) ?
+          FRAGMENT_METHOD_TIME : DEFAULT_FRAGMENT_METHOD,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->request_new_pad =
@@ -1511,6 +1511,39 @@ gst_qt_mux_prepare_and_send_ftyp (GstQTMux * qtmux)
   return gst_qt_mux_send_ftyp (qtmux, &qtmux->header_size);
 }
 
+static GstFlowReturn
+gst_qt_mux_prepare_and_send_styp (GstQTMux * qtmux, guint32 major,
+    GList * brands)
+{
+  AtomFTYP *styp = NULL;
+  GstBuffer *buf;
+  guint64 size = 0, offset = 0, off = 0;
+  guint8 *data = NULL;
+
+  GST_DEBUG_OBJECT (qtmux, "Preparing to send styp atom");
+
+  styp = atom_styp_new (qtmux->context, major, 0, brands);
+
+  GST_DEBUG_OBJECT (qtmux, "Sending styp atom");
+
+  if (!atom_ftyp_copy_data (styp, &data, &size, &offset))
+    goto serialize_error;
+
+  buf = _gst_buffer_new_take_data (data, offset);
+
+  GST_LOG_OBJECT (qtmux, "Pushing styp");
+  return gst_qt_mux_send_buffer (qtmux, buf, &off, FALSE);
+
+  /* ERRORS */
+serialize_error:
+  {
+    GST_ELEMENT_ERROR (qtmux, STREAM, MUX, (NULL),
+        ("Failed to serialize ftyp"));
+    return GST_FLOW_ERROR;
+  }
+  return gst_qt_mux_send_ftyp (qtmux, NULL);
+}
+
 static void
 gst_qt_mux_set_header_on_caps (GstQTMux * mux, GstBuffer * buf)
 {
@@ -2003,6 +2036,7 @@ gst_qt_mux_pad_fragment_add_buffer (GstQTMux * qtmux, GstQTPad * pad,
 {
   GstFlowReturn ret = GST_FLOW_OK;
   gboolean pad_sync, event_sync, time_sync;
+  GstQTMuxClass *qtmux_klass = (GstQTMuxClass *) (G_OBJECT_GET_CLASS (qtmux));
 
   /* setup if needed */
   if (G_UNLIKELY (!pad->traf || force))
@@ -2026,6 +2060,11 @@ flush:
 
     if (GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT)) {
       GST_WARNING ("Next fragment will not start with a keyframe");
+    }
+
+    if (qtmux_klass->format == GST_QT_MUX_FORMAT_DASH) {
+      GList *brands = NULL;
+      gst_qt_mux_prepare_and_send_styp (qtmux, FOURCC_msdh, brands);
     }
 
     /* now we know where moof ends up, update offset in tfra */

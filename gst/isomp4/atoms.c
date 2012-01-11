@@ -238,12 +238,13 @@ atom_uuid_free (AtomUUID * data)
 }
 
 static void
-atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+atom_brands_init (AtomFTYP * ftyp, guint32 fourcc, guint32 major,
+    guint32 version, GList * brands)
 {
   gint index;
   GList *it = NULL;
 
-  atom_header_set (&ftyp->header, FOURCC_ftyp, 16, 0);
+  atom_header_set (&ftyp->header, fourcc, 16, 0);
   ftyp->major_brand = major;
   ftyp->version = version;
 
@@ -258,6 +259,12 @@ atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
   }
 }
 
+static void
+atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+{
+  atom_brands_init (ftyp, FOURCC_ftyp, major, version, brands);
+}
+
 AtomFTYP *
 atom_ftyp_new (AtomsContext * context, guint32 major, guint32 version,
     GList * brands)
@@ -265,6 +272,22 @@ atom_ftyp_new (AtomsContext * context, guint32 major, guint32 version,
   AtomFTYP *ftyp = g_new0 (AtomFTYP, 1);
 
   atom_ftyp_init (ftyp, major, version, brands);
+  return ftyp;
+}
+
+static void
+atom_styp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+{
+  atom_brands_init (ftyp, FOURCC_styp, major, version, brands);
+}
+
+AtomFTYP *
+atom_styp_new (AtomsContext * context, guint32 major, guint32 version,
+    GList * brands)
+{
+  AtomFTYP *ftyp = g_new0 (AtomFTYP, 1);
+
+  atom_styp_init (ftyp, major, version, brands);
   return ftyp;
 }
 

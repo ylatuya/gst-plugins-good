@@ -864,6 +864,8 @@ void       atom_tfra_update_offset     (AtomTFRA * tfra, guint64 offset);
 void       atom_mfra_add_tfra          (AtomMFRA *mfra, AtomTFRA *tfra);
 guint64    atom_mfra_copy_data         (AtomMFRA *mfra, guint8 **buffer, guint64 *size, guint64* offset);
 
+AtomFTYP*  atom_styp_new               (AtomsContext *context, guint32 major,
+                                        guint32 version, GList *brands);
 
 /* media sample description related helpers */
 

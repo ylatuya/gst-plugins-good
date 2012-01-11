@@ -62,6 +62,10 @@ G_BEGIN_DECLS
 #define FOURCC_qt__     GST_MAKE_FOURCC('q','t',' ',' ')
 #define FOURCC_isml     GST_MAKE_FOURCC('i','s','m','l')
 #define FOURCC_piff     GST_MAKE_FOURCC('p','i','f','f')
+/* DASH */
+#define FOURCC_styp     GST_MAKE_FOURCC('s','t','y','p')
+#define FOURCC_dash     GST_MAKE_FOURCC('d','a','s','h')
+#define FOURCC_msdh     GST_MAKE_FOURCC('m','s','d','h')
 
 G_END_DECLS
 
