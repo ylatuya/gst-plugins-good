@@ -163,6 +163,8 @@ struct _GstQTMux
   guint64 mdat_size;
   /* position of mdat atom (for later updating) */
   guint64 mdat_pos;
+  /* position of moov atom (for later updating) */
+  guint64 moov_pos;
 
   /* keep track of the largest chunk to fine-tune brands */
   GstClockTime longest_chunk;
@@ -173,6 +175,12 @@ struct _GstQTMux
   AtomMOOV *moov;
   GSList *extra_atoms; /* list of extra top-level atoms (e.g. UUID for xmp)
                         * Stored as AtomInfo structs */
+
+  /* Header buffers */
+  GstBuffer *prefix_buf;
+  GstBuffer *ftyp_buf;
+  GstBuffer *moov_buf;
+  GstBuffer *extra_atoms_buf;
 
   /* fragmented file index */
   AtomMFRA *mfra;

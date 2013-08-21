@@ -467,6 +467,7 @@ gst_qt_mux_reset (GstQTMux * qtmux, gboolean alloc)
   qtmux->header_size = 0;
   qtmux->mdat_size = 0;
   qtmux->mdat_pos = 0;
+  qtmux->moov_pos = 0;
   qtmux->longest_chunk = GST_CLOCK_TIME_NONE;
   qtmux->video_pads = 0;
   qtmux->audio_pads = 0;
@@ -484,6 +485,12 @@ gst_qt_mux_reset (GstQTMux * qtmux, gboolean alloc)
     atom_mfra_free (qtmux->mfra);
     qtmux->mfra = NULL;
   }
+
+  gst_buffer_replace (&qtmux->ftyp_buf, NULL);
+  gst_buffer_replace (&qtmux->ftyp_buf, NULL);
+  gst_buffer_replace (&qtmux->moov_buf, NULL);
+  gst_buffer_replace (&qtmux->extra_atoms_buf, NULL);
+
   if (qtmux->fast_start_file) {
     fclose (qtmux->fast_start_file);
     g_remove (qtmux->fast_start_file_path);
@@ -1522,21 +1529,22 @@ gst_qt_mux_update_mdat_size (GstQTMux * qtmux, guint64 mdat_pos,
 }
 
 static GstFlowReturn
-gst_qt_mux_send_ftyp (GstQTMux * qtmux, guint64 * off)
+gst_qt_mux_queue_ftyp (GstQTMux * qtmux)
 {
   GstBuffer *buf;
   guint64 size = 0, offset = 0;
   guint8 *data = NULL;
 
-  GST_DEBUG_OBJECT (qtmux, "Sending ftyp atom");
+  GST_DEBUG_OBJECT (qtmux, "Queueing ftyp atom");
 
   if (!atom_ftyp_copy_data (qtmux->ftyp, &data, &size, &offset))
     goto serialize_error;
 
   buf = _gst_buffer_new_take_data (data, offset);
 
-  GST_LOG_OBJECT (qtmux, "Pushing ftyp");
-  return gst_qt_mux_send_buffer (qtmux, buf, off, FALSE);
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_HEADER);
+  gst_buffer_replace (&qtmux->ftyp_buf, gst_buffer_ref (buf));
+  return GST_FLOW_OK;
 
   /* ERRORS */
 serialize_error:
@@ -1576,9 +1584,8 @@ gst_qt_mux_prepare_ftyp (GstQTMux * qtmux, AtomFTYP ** p_ftyp,
 }
 
 static GstFlowReturn
-gst_qt_mux_prepare_and_send_ftyp (GstQTMux * qtmux)
+gst_qt_mux_prepare_and_queue_ftyp (GstQTMux * qtmux)
 {
-  GstFlowReturn ret = GST_FLOW_OK;
   GstBuffer *prefix = NULL;
 
   GST_DEBUG_OBJECT (qtmux, "Preparing to send ftyp atom");
@@ -1590,11 +1597,9 @@ gst_qt_mux_prepare_and_send_ftyp (GstQTMux * qtmux)
   }
   gst_qt_mux_prepare_ftyp (qtmux, &qtmux->ftyp, &prefix);
   if (prefix) {
-    ret = gst_qt_mux_send_buffer (qtmux, prefix, &qtmux->header_size, FALSE);
-    if (ret != GST_FLOW_OK)
-      return ret;
+    gst_buffer_replace (&qtmux->prefix_buf, prefix);
   }
-  return gst_qt_mux_send_ftyp (qtmux, &qtmux->header_size);
+  return gst_qt_mux_queue_ftyp (qtmux);
 }
 
 static GstFlowReturn
@@ -1627,35 +1632,92 @@ serialize_error:
         ("Failed to serialize styp"));
     return GST_FLOW_ERROR;
   }
-  return gst_qt_mux_send_ftyp (qtmux, NULL);
 }
 
-static void
-gst_qt_mux_set_header_on_caps (GstQTMux * mux, GstBuffer * buf)
+static GstFlowReturn
+gst_qt_mux_send_headers (GstQTMux * mux, gboolean set_caps,
+    gboolean send_prefix_ftyp, gboolean send_moov_extra_atoms)
 {
-  GstStructure *structure;
-  GValue array = { 0 };
-  GValue value = { 0 };
-  GstCaps *caps, *tcaps;
+  GstFlowReturn ret = GST_FLOW_OK;
 
-  tcaps = gst_pad_get_current_caps (mux->srcpad);
-  caps = gst_caps_copy (tcaps);
-  gst_caps_unref (tcaps);
+  if (set_caps) {
+    GstStructure *structure;
+    GValue array = { 0 };
+    GValue value = { 0 };
+    GstCaps *caps, *tcaps;
+    GstBuffer *buf;
 
-  structure = gst_caps_get_structure (caps, 0);
+    g_return_val_if_fail (mux->ftyp_buf != NULL && mux->moov_buf != NULL,
+        GST_FLOW_ERROR);
 
-  g_value_init (&array, GST_TYPE_ARRAY);
+    tcaps = gst_pad_get_current_caps (mux->srcpad);
+    caps = gst_caps_copy (tcaps);
+    gst_caps_unref (tcaps);
 
-  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_HEADER);
-  g_value_init (&value, GST_TYPE_BUFFER);
-  gst_value_take_buffer (&value, gst_buffer_ref (buf));
-  gst_value_array_append_value (&array, &value);
-  g_value_unset (&value);
+    structure = gst_caps_get_structure (caps, 0);
 
-  gst_structure_set_value (structure, "streamheader", &array);
-  g_value_unset (&array);
-  gst_pad_set_caps (mux->srcpad, caps);
-  gst_caps_unref (caps);
+    g_value_init (&array, GST_TYPE_ARRAY);
+
+    if (mux->prefix_buf) {
+      buf = mux->prefix_buf;
+      g_value_init (&value, GST_TYPE_BUFFER);
+      gst_value_take_buffer (&value, gst_buffer_ref (buf));
+      gst_value_array_append_value (&array, &value);
+      g_value_unset (&value);
+    }
+
+    buf = mux->ftyp_buf;
+    g_value_init (&value, GST_TYPE_BUFFER);
+    gst_value_take_buffer (&value, gst_buffer_ref (buf));
+    gst_value_array_append_value (&array, &value);
+    g_value_unset (&value);
+
+    buf = mux->moov_buf;
+    g_value_init (&value, GST_TYPE_BUFFER);
+    gst_value_take_buffer (&value, gst_buffer_ref (buf));
+    gst_value_array_append_value (&array, &value);
+    g_value_unset (&value);
+
+    if (mux->extra_atoms_buf) {
+      buf = mux->extra_atoms_buf;
+      g_value_init (&value, GST_TYPE_BUFFER);
+      gst_value_take_buffer (&value, gst_buffer_ref (buf));
+      gst_value_array_append_value (&array, &value);
+      g_value_unset (&value);
+    }
+
+    gst_structure_set_value (structure, "streamheader", &array);
+    g_value_unset (&array);
+    gst_pad_set_caps (mux->srcpad, caps);
+    gst_caps_unref (caps);
+  }
+
+  if (send_prefix_ftyp) {
+    if (mux->prefix_buf) {
+      ret = gst_qt_mux_send_buffer (mux, gst_buffer_ref (mux->prefix_buf),
+          &mux->header_size, FALSE);
+      if (ret != GST_FLOW_OK)
+        return ret;
+    }
+    ret = gst_qt_mux_send_buffer (mux, gst_buffer_ref (mux->ftyp_buf),
+        &mux->header_size, FALSE);
+    if (ret != GST_FLOW_OK)
+      return ret;
+    mux->moov_pos = mux->header_size;
+  }
+  if (send_moov_extra_atoms) {
+    ret = gst_qt_mux_send_buffer (mux, gst_buffer_ref (mux->moov_buf),
+        &mux->header_size, FALSE);
+    if (ret != GST_FLOW_OK)
+      return ret;
+    if (mux->extra_atoms_buf) {
+      ret = gst_qt_mux_send_buffer (mux, gst_buffer_ref (mux->extra_atoms_buf),
+          &mux->header_size, FALSE);
+      if (ret != GST_FLOW_OK)
+        return ret;
+    }
+  }
+  return ret;
 }
 
 static void
@@ -1684,12 +1746,11 @@ gst_qt_mux_configure_moov (GstQTMux * qtmux, guint32 * _timescale)
 }
 
 static GstFlowReturn
-gst_qt_mux_send_moov (GstQTMux * qtmux, guint64 * _offset, gboolean mind_fast)
+gst_qt_mux_queue_moov (GstQTMux * qtmux)
 {
   guint64 offset = 0, size = 0;
   guint8 *data;
   GstBuffer *buf;
-  GstFlowReturn ret = GST_FLOW_OK;
 
   /* serialize moov */
   offset = size = 0;
@@ -1700,10 +1761,9 @@ gst_qt_mux_send_moov (GstQTMux * qtmux, guint64 * _offset, gboolean mind_fast)
 
   buf = _gst_buffer_new_take_data (data, offset);
   GST_DEBUG_OBJECT (qtmux, "Pushing moov atoms");
-  gst_qt_mux_set_header_on_caps (qtmux, buf);
-  ret = gst_qt_mux_send_buffer (qtmux, buf, _offset, mind_fast);
-
-  return ret;
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_HEADER);
+  gst_buffer_replace (&qtmux->moov_buf, buf);
+  return GST_FLOW_OK;
 
 serialize_error:
   {
@@ -1714,37 +1774,36 @@ serialize_error:
 
 /* either calculates size of extra atoms or pushes them */
 static GstFlowReturn
-gst_qt_mux_send_extra_atoms (GstQTMux * qtmux, gboolean send, guint64 * offset,
-    gboolean mind_fast)
+gst_qt_mux_queue_extra_atoms (GstQTMux * qtmux)
 {
   GSList *walk;
   guint64 loffset = 0, size = 0;
   guint8 *data;
   GstFlowReturn ret = GST_FLOW_OK;
+  GstBuffer *buf;
+
+  gst_buffer_replace (&qtmux->extra_atoms_buf, NULL);
 
   for (walk = qtmux->extra_atoms; walk; walk = g_slist_next (walk)) {
     AtomInfo *ainfo = (AtomInfo *) walk->data;
 
     loffset = size = 0;
     data = NULL;
-    if (!ainfo->copy_data_func (ainfo->atom,
-            send ? &data : NULL, &size, &loffset))
+    if (!ainfo->copy_data_func (ainfo->atom, &data, &size, &loffset))
       goto serialize_error;
 
-    if (send) {
-      GstBuffer *buf;
-
-      GST_DEBUG_OBJECT (qtmux,
-          "Pushing extra top-level atom %" GST_FOURCC_FORMAT,
-          GST_FOURCC_ARGS (ainfo->atom->type));
-      buf = _gst_buffer_new_take_data (data, loffset);
-      ret = gst_qt_mux_send_buffer (qtmux, buf, offset, FALSE);
-      if (ret != GST_FLOW_OK)
-        break;
+    GST_DEBUG_OBJECT (qtmux,
+        "Pushing extra top-level atom %" GST_FOURCC_FORMAT,
+        GST_FOURCC_ARGS (ainfo->atom->type));
+    buf = _gst_buffer_new_take_data (data, loffset);
+    GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_HEADER);
+    if (qtmux->extra_atoms_buf == NULL) {
+      qtmux->extra_atoms_buf = gst_buffer_copy (buf);
     } else {
-      if (offset)
-        *offset += loffset;
+      gst_buffer_copy_into (qtmux->extra_atoms_buf, buf,
+          GST_BUFFER_COPY_MEMORY, 0, -1);
     }
+    gst_buffer_unref (buf);
   }
 
   return ret;
@@ -1886,13 +1945,10 @@ gst_qt_mux_start_file (GstQTMux * qtmux)
       goto exit;
 
   } else {
-    ret = gst_qt_mux_prepare_and_send_ftyp (qtmux);
+    ret = gst_qt_mux_prepare_and_queue_ftyp (qtmux);
     if (ret != GST_FLOW_OK) {
       goto exit;
     }
-
-    /* well, it's moov pos if fragmented ... */
-    qtmux->mdat_pos = qtmux->header_size;
 
     if (qtmux->fragment_method != FRAGMENT_METHOD_NONE) {
       if (qtmux->fragment_method == FRAGMENT_METHOD_TIME) {
@@ -1907,18 +1963,25 @@ gst_qt_mux_start_file (GstQTMux * qtmux)
       /* prepare moov and/or tags */
       gst_qt_mux_configure_moov (qtmux, NULL);
       gst_qt_mux_setup_metadata (qtmux);
-      ret = gst_qt_mux_send_moov (qtmux, &qtmux->header_size, FALSE);
+      ret = gst_qt_mux_queue_moov (qtmux);
       if (ret != GST_FLOW_OK)
         return ret;
       /* extra atoms */
-      ret =
-          gst_qt_mux_send_extra_atoms (qtmux, TRUE, &qtmux->header_size, FALSE);
+      ret = gst_qt_mux_queue_extra_atoms (qtmux);
       if (ret != GST_FLOW_OK)
         return ret;
+      /* Send the whole header (prefix + ftyp + moov + extra_atoms */
+      gst_qt_mux_send_headers (qtmux, TRUE, TRUE, TRUE);
+
       /* prepare index */
       if (!qtmux->streamable)
         qtmux->mfra = atom_mfra_new (qtmux->context);
     } else {
+      /* Send prefix + ftyp but don't set the streamheader in caps yet */
+      gst_qt_mux_send_headers (qtmux, FALSE, TRUE, FALSE);
+
+      qtmux->mdat_pos = qtmux->header_size;
+
       /* extended to ensure some spare space */
       ret = gst_qt_mux_send_mdat_header (qtmux, &qtmux->header_size, 0, TRUE);
     }
@@ -2060,10 +2123,13 @@ gst_qt_mux_stop_file (GstQTMux * qtmux)
         GST_TIME_FORMAT, GST_TIME_ARGS (first_ts));
     /* seek and rewrite the header */
     gst_segment_init (&segment, GST_FORMAT_BYTES);
-    segment.start = qtmux->mdat_pos;
+    segment.start = qtmux->moov_pos;
     gst_pad_push_event (qtmux->srcpad, gst_event_new_segment (&segment));
     /* no need to seek back */
-    return gst_qt_mux_send_moov (qtmux, NULL, FALSE);
+    ret = gst_qt_mux_queue_moov (qtmux);
+    /* Rewrite moov and update streamheader in caps */
+    gst_qt_mux_send_headers (qtmux, TRUE, FALSE, TRUE);
+    return ret;
   }
 
   gst_qt_mux_configure_moov (qtmux, &timescale);
@@ -2110,44 +2176,50 @@ gst_qt_mux_stop_file (GstQTMux * qtmux)
   gst_qt_mux_setup_metadata (qtmux);
 
   large_file = (qtmux->mdat_size > MDAT_LARGE_FILE_LIMIT);
+
+  /* Queue extra atoms */
+  ret = gst_qt_mux_queue_extra_atoms (qtmux);
+  if (ret != GST_FLOW_OK)
+    return ret;
+
   /* if faststart, update the offset of the atoms in the movie with the offset
-   * that the movie headers before mdat will cause.
-   * Also, send the ftyp */
+   * that the movie headers before mdat will cause. */
   if (qtmux->fast_start_file) {
     GstFlowReturn flow_ret;
     offset = size = 0;
 
-    flow_ret = gst_qt_mux_prepare_and_send_ftyp (qtmux);
-    if (flow_ret != GST_FLOW_OK) {
-      goto ftyp_error;
-    }
-    /* copy into NULL to obtain size */
-    if (!atom_moov_copy_data (qtmux->moov, NULL, &size, &offset))
-      goto serialize_error;
-    GST_DEBUG_OBJECT (qtmux, "calculated moov atom size %" G_GUINT64_FORMAT,
-        offset);
-    offset += qtmux->header_size + (large_file ? 16 : 8);
-
-    /* sum up with the extra atoms size */
-    ret = gst_qt_mux_send_extra_atoms (qtmux, FALSE, &offset, FALSE);
+    /* Queue ftyp */
+    ret = gst_qt_mux_prepare_and_queue_ftyp (qtmux);
     if (ret != GST_FLOW_OK)
       return ret;
+
+    /* Queue the moov atom to get its real size and update the offsets */
+    flow_ret = gst_qt_mux_queue_moov (qtmux);
+    if (flow_ret != GST_FLOW_OK)
+      return ret;
+    if (qtmux->prefix_buf)
+      offset += gst_buffer_get_size (qtmux->prefix_buf);
+    offset += gst_buffer_get_size (qtmux->ftyp_buf);
+    offset += gst_buffer_get_size (qtmux->moov_buf);
+    if (qtmux->extra_atoms_buf)
+      offset += gst_buffer_get_size (qtmux->extra_atoms_buf);
+    offset += large_file ? 16 : 8;
+    GST_DEBUG_OBJECT (qtmux, "calculated header size %" G_GUINT64_FORMAT,
+        offset);
   } else {
     offset = qtmux->header_size;
   }
   atom_moov_chunks_add_offset (qtmux->moov, offset);
 
-  /* moov */
-  /* note: as of this point, we no longer care about tracking written data size,
-   * since there is no more use for it anyway */
-  ret = gst_qt_mux_send_moov (qtmux, NULL, FALSE);
+  /* Queue moov */
+  ret = gst_qt_mux_queue_moov (qtmux);
   if (ret != GST_FLOW_OK)
     return ret;
 
-  /* extra atoms */
-  ret = gst_qt_mux_send_extra_atoms (qtmux, TRUE, NULL, FALSE);
-  if (ret != GST_FLOW_OK)
-    return ret;
+  /* Send the remaing header buffers (moov + extra atoms)
+   * and if it's a fast_start file send the whole header.
+   * Also update streamheader in caps */
+  gst_qt_mux_send_headers (qtmux, TRUE, qtmux->fast_start, TRUE);
 
   /* if needed, send mdat atom and move buffered data into it */
   if (qtmux->fast_start_file) {
@@ -2175,11 +2247,6 @@ serialize_error:
   {
     GST_ELEMENT_ERROR (qtmux, STREAM, MUX, (NULL),
         ("Failed to serialize moov"));
-    return GST_FLOW_ERROR;
-  }
-ftyp_error:
-  {
-    GST_ELEMENT_ERROR (qtmux, STREAM, MUX, (NULL), ("Failed to send ftyp"));
     return GST_FLOW_ERROR;
   }
 }
