@@ -3578,6 +3578,45 @@ atom_trak_set_subtitle_type (AtomTRAK * trak, AtomsContext * context,
   trak->is_h264 = FALSE;
 }
 
+static AtomTFDT *
+atom_tfdt_new (guint64 decode_time)
+{
+  guint8 flags[3] = { 0, 0, 0 };
+  AtomTFDT *tfdt = g_new0 (AtomTFDT, 1);
+
+  atom_full_init (&tfdt->header, FOURCC_tfdt, 0, 0, 0, flags);
+  tfdt->decode_time = decode_time;
+  tfdt->header.version = 1;
+  return tfdt;
+}
+
+static void
+atom_tfdt_free (AtomTFDT * tfdt)
+{
+  atom_full_clear (&tfdt->header);
+  g_free (tfdt);
+}
+
+static guint64
+atom_tfdt_copy_data (AtomTFDT * tfdt, guint8 ** buffer, guint64 * size,
+    guint64 * offset)
+{
+  guint64 original_offset = *offset;
+
+  if (!atom_full_copy_data (&tfdt->header, buffer, size, offset)) {
+    return 0;
+  }
+
+  if (tfdt->header.version) {
+    prop_copy_uint64 (tfdt->decode_time, buffer, size, offset);
+  } else {
+    prop_copy_uint32 (tfdt->decode_time, buffer, size, offset);
+  }
+
+  atom_write_size (buffer, size, offset, original_offset);
+  return *offset - original_offset;
+}
+
 static void
 atom_mfhd_init (AtomMFHD * mfhd, guint32 sequence_number)
 {
@@ -3642,6 +3681,10 @@ atom_traf_free (AtomTRAF * traf)
   g_list_free (traf->sdtps);
   traf->sdtps = NULL;
 
+  if (traf->tfdt) {
+    atom_tfdt_free (traf->tfdt);
+    traf->tfdt = NULL;
+  }
   g_free (traf);
 }
 
@@ -3787,6 +3830,11 @@ atom_traf_copy_data (AtomTRAF * traf, guint8 ** buffer, guint64 * size,
   }
   if (!atom_tfhd_copy_data (&traf->tfhd, buffer, size, offset)) {
     return 0;
+  }
+  if (traf->tfdt) {
+    if (!atom_tfdt_copy_data (traf->tfdt, buffer, size, offset)) {
+      return 0;
+    }
   }
 
   walker = g_list_first (traf->truns);
@@ -3936,6 +3984,7 @@ atom_traf_init (AtomTRAF * traf, AtomsContext * context, guint32 track_ID)
   atom_header_set (&traf->header, FOURCC_traf, 0, 0);
   atom_tfhd_init (&traf->tfhd, track_ID);
   traf->truns = NULL;
+  traf->tfdt = NULL;
 
   if (context->flavor == ATOMS_TREE_FLAVOR_ISML)
     atom_traf_add_sdtp (traf, atom_sdtp_new (context));
@@ -4008,6 +4057,15 @@ atom_traf_add_samples (AtomTRAF * traf, guint32 delta, guint32 size,
 
   if (traf->sdtps)
     atom_sdtp_add_samples (traf->sdtps->data, 0x10 | ((flags & 0xff) >> 4));
+}
+
+void
+atom_traf_add_decode_time (AtomTRAF * traf, guint64 decode_time)
+{
+  if (traf->tfdt != NULL) {
+    atom_tfdt_free (traf->tfdt);
+  }
+  traf->tfdt = atom_tfdt_new ((guint64) decode_time);
 }
 
 guint32

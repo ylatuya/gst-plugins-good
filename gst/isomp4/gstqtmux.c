@@ -2344,6 +2344,7 @@ init:
   if (G_UNLIKELY (!pad->traf)) {
     GST_LOG_OBJECT (qtmux, "setting up new fragment");
     pad->traf = atom_traf_new (qtmux->context, atom_trak_get_id (pad->trak));
+    atom_traf_add_decode_time (pad->traf, dts);
     atom_array_init (&pad->fragment_buffers, 512);
     if (qtmux->fragment_method == FRAGMENT_METHOD_TIME)
       pad->fragment_duration = gst_util_uint64_scale (qtmux->fragment_duration,
