@@ -324,10 +324,12 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
 {
   GObjectClass *gobject_class;
   GstElementClass *gstelement_class;
-  const gchar *streamable_desc;
+  const gchar *streamable_desc, *duration_desc;
   gboolean streamable;
 #define STREAMABLE_DESC "If set to true, the output should be as if it is to "\
   "be streamed and hence no indexes written or duration written."
+#define DURATION_DESC "Fragment durations in ms (used when the "\
+  "fragment-method='time')"
 
   gobject_class = (GObjectClass *) klass;
   gstelement_class = (GstElementClass *) klass;
@@ -340,10 +342,13 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
 
   if (GST_QT_MUX_IS_FRAGMENTED (klass)) {
     streamable_desc = STREAMABLE_DESC;
+    duration_desc = DURATION_DESC;
     streamable = DEFAULT_STREAMABLE;
   } else {
     streamable_desc =
         STREAMABLE_DESC " (DEPRECATED, only valid for fragmented MP4)";
+    duration_desc =
+        DURATION_DESC " (DEPRECATED, only valid for fragmented MP4)";
     streamable = FALSE;
   }
 
@@ -391,8 +396,7 @@ gst_qt_mux_class_init (GstQTMuxClass * klass)
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_FRAGMENT_DURATION,
       g_param_spec_uint ("fragment-duration", "Fragment duration",
-          "Fragment durations in ms (used when the fragment-method='time')",
-          0, G_MAXUINT32, DEFAULT_FRAGMENT_DURATION,
+          duration_desc, 0, G_MAXUINT32, DEFAULT_FRAGMENT_DURATION,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_STREAMABLE,
       g_param_spec_boolean ("streamable", "Streamable", streamable_desc,
@@ -3910,9 +3914,14 @@ gst_qt_mux_get_property (GObject * object,
     case PROP_MOOV_RECOV_FILE:
       g_value_set_string (value, qtmux->moov_recov_file_path);
       break;
-    case PROP_FRAGMENT_DURATION:
-      g_value_set_uint (value, qtmux->fragment_duration);
+    case PROP_FRAGMENT_DURATION:{
+      if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
+        g_value_set_uint (value, qtmux->fragment_duration);
+      } else {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      }
       break;
+    }
     case PROP_STREAMABLE:{
       if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
         g_value_set_boolean (value, qtmux->streamable);
@@ -3988,7 +3997,11 @@ gst_qt_mux_set_property (GObject * object,
       qtmux->moov_recov_file_path = g_value_dup_string (value);
       break;
     case PROP_FRAGMENT_DURATION:
-      qtmux->fragment_duration = g_value_get_uint (value);
+      if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
+        qtmux->fragment_duration = g_value_get_uint (value);
+      } else {
+        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      }
       break;
     case PROP_STREAMABLE:{
       if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
