@@ -228,7 +228,7 @@ enum
 #define DEFAULT_MOOV_RECOV_FILE         NULL
 #define DEFAULT_FRAGMENT_DURATION       2 * GST_SECOND
 #define DEFAULT_STREAMABLE              TRUE
-#define DEFAULT_FRAGMENT_METHOD         FRAGMENT_METHOD_NONE
+#define DEFAULT_FRAGMENT_METHOD         FRAGMENT_METHOD_EVENT
 #ifndef GST_REMOVE_DEPRECATED
 #define DEFAULT_DTS_METHOD              DTS_METHOD_REORDER
 #endif
@@ -561,7 +561,7 @@ gst_qt_mux_init (GstQTMux * qtmux, GstQTMuxClass * qtmux_klass)
       GST_DEBUG_FUNCPTR (gst_collect_pads_clip_running_time), qtmux);
 
   /* properties set to default upon construction */
-  if (qtmux_klass->format == GST_QT_MUX_FORMAT_ISML) {
+  if (GST_QT_MUX_IS_FRAGMENTED (qtmux_klass)) {
     qtmux->fragment_method = DEFAULT_FRAGMENT_METHOD;
   } else {
     qtmux->fragment_method = FRAGMENT_METHOD_NONE;
